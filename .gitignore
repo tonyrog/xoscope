@@ -1,0 +1,12 @@
+*.o
+.deps
+Makefile
+autom4te.cache
+config.log
+config.status
+operl
+stamp-h1
+xoscope
+gtkdatabox-0.6.0.0/gtk/libgtkdatabox.a
+
+
