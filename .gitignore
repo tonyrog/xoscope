@@ -4,6 +4,7 @@ Makefile
 autom4te.cache
 config.log
 config.status
+config.h
 operl
 stamp-h1
 xoscope
