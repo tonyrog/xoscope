@@ -30,9 +30,13 @@
 #ifdef HAVE_LIBESD
 #include <esd.h>
 #endif
+#ifdef HAVE_ASOUND
+#include <alsa/asoundlib.h>
+#endif
 
 #define ESDDEVICE "ESounD"
 #define SOUNDDEVICE "/dev/dsp"
+#define ASOUNDDEV   "hw:0,0"
 
 static int snd = -2;		/* file descriptor for /dev/dsp */
 static int esd = -2;		/* file descriptor for ESD */
@@ -41,6 +45,12 @@ static int esd = -2;		/* file descriptor for ESD */
 static int esdblock = 0;	/* 1 to block ESD; 0 to non-block */
 static int esdrecord = 0;	/* 1 to use ESD record mode; 0 to use ESD monitor mode */
 #endif
+
+#ifdef HAVE_ASOUND
+snd_pcm_t* pcm = NULL;
+snd_pcm_hw_params_t* params = NULL;
+#endif
+
 
 static int sc_chans = 0;
 static int sound_card_rate = DEF_R;	/* sampling rate of sound card */
@@ -59,6 +69,11 @@ static char * snd_errormsg2 = NULL;
 #ifdef HAVE_LIBESD
 static char * esd_errormsg1 = NULL;
 static char * esd_errormsg2 = NULL;
+#endif
+
+#ifdef HAVE_ASOUND
+static char * asound_errormsg1 = NULL;
+static char * asound_errormsg2 = NULL;
 #endif
 
 /* This function is defined as do-nothing and weak, meaning it can be
@@ -140,6 +155,84 @@ open_ESD(void)
 
 #endif
 
+#ifdef HAVE_ASOUND
+static void close_asound()
+{
+    if (pcm != NULL) {
+	snd_pcm_close(pcm);
+	pcm = NULL;
+    }
+    if (params != NULL) {
+	// snd_pcm_hw_params_free(params);
+	params = NULL;
+    }
+}
+
+static int open_asound(void)
+{
+    int rc;
+    snd_pcm_uframes_t frames;
+    int chans = 2;
+    unsigned int val;
+    unsigned int rate;
+    snd_pcm_format_t format;
+
+    if (pcm != NULL)
+	return 1;
+    rc = snd_pcm_open(&pcm, ASOUNDDEV, SND_PCM_STREAM_CAPTURE, 
+		      SND_PCM_NONBLOCK);
+    fprintf(stderr, "ALSA open = %d, pcm=%p\n", rc, pcm);
+    if (rc < 0) {
+	asound_errormsg1 = "opening " ASOUNDDEV;
+	asound_errormsg2 = (char*) snd_strerror(rc);
+	return 0;
+    }
+    snd_pcm_hw_params_alloca(&params);    // allocate hardware params
+    snd_pcm_hw_params_any(pcm, params);   // fill with defaults
+
+    snd_pcm_hw_params_set_rate_resample(pcm, params, 1);
+
+    // read default values and print them
+    snd_pcm_hw_params_get_channels(params, &val);
+    fprintf(stderr, "default channels = %d\n", val);
+    snd_pcm_hw_params_get_format(params, &format);
+    fprintf(stderr, "default format = %s\n", snd_pcm_format_name(format));
+    snd_pcm_hw_params_get_rate(params, &rate, 0);
+    fprintf(stderr, "default rate = %u\n", rate);
+
+    snd_pcm_hw_params_set_access(pcm, params, SND_PCM_ACCESS_RW_INTERLEAVED);
+    snd_pcm_hw_params_set_format(pcm, params, SND_PCM_FORMAT_S8); // S16_LE);
+
+    sc_chans = chans;
+    snd_pcm_hw_params_set_channels(pcm, params, chans);
+
+    sound_card_rate = 8000;
+    val = sound_card_rate;
+    snd_pcm_hw_params_set_rate_near(pcm, params, &val, 0);
+    frames = 32;
+    snd_pcm_hw_params_set_period_size_near(pcm, params, &frames, 0);
+
+    snd_pcm_hw_params_get_channels(params, &val);
+    fprintf(stderr, "channels = %d\n", val);
+    snd_pcm_hw_params_get_format(params, &format);
+    fprintf(stderr, "format = %s\n", snd_pcm_format_name(format));
+    snd_pcm_hw_params_get_rate(params, &rate, 0);
+    fprintf(stderr, "rate = %u\n", rate);
+
+    rc = snd_pcm_hw_params(pcm, params);
+    // rc = 0;
+    fprintf(stderr, "ALSO open = %d\n", rc);
+    if (rc < 0) {
+	asound_errormsg1 = "set hw " ASOUNDDEV;
+	asound_errormsg2 = (char*) snd_strerror(rc);
+	snd_pcm_close(pcm);
+	return 0;
+    }
+
+    return 1;
+}
+#endif
+
 /* turn the sound device (/dev/dsp) on */
 static int
 open_sound_card(void)
@@ -203,6 +296,16 @@ reset_sound_card(void)
   }
 #endif
 
+#ifdef HAVE_ASOUND
+  if (pcm != NULL) {
+      close_asound();
+      open_asound();
+      // if (pcm != NULL) snd_pcm_drain(pcm);
+      fprintf(stderr, "ALSO reset done\n");
+  }
+#endif
+
+
   if (snd >= 0) {
 
     close_sound_card();
@@ -227,10 +330,17 @@ static int esd_nchans(void)
 
 #endif
 
+#ifdef HAVE_ASOUND
+static int asound_nchans(void)
+{
+    if (pcm == NULL) open_asound();
+    return (pcm != NULL) ? sc_chans : 0;
+}
+#endif
+
 static int sc_nchans(void)
 {
   if (snd == -2) open_sound_card();
-
   return (snd >= 0) ? sc_chans : 0;
 }
 
@@ -342,10 +452,12 @@ get_data()
 {
   static unsigned char buffer[MAXWID * 2];
   static int i, j, delay;
+  snd_pcm_uframes_t frames = 32;
   int fd;
 
   if (snd >= 0) fd = snd;
   else if (esd >= 0) fd = esd;
+  else if (pcm != NULL) fd=-1;
   else return (0);
 
   if (!in_progress) {
@@ -354,17 +466,33 @@ get_data()
        don't know how many are available (do we?) so we discard them
        all to start with a fresh buffer that hopefully won't wrap
        around before we get it read. */
-
-    /* read until we get something smaller than a full buffer */
-    while ((j = read(fd, buffer, sizeof(buffer))) == sizeof(buffer));
-
+      
+      if (pcm != NULL) {
+	  // snd_pcm_drain(pcm);
+	  fprintf(stderr, "ALSA1 read(%d)\n", frames);
+	  j = snd_pcm_readi(pcm, buffer, frames);
+	  fprintf(stderr, "ALSA1 read = %d\n", j);
+	  if (j > 0) j *= sc_chans * 1;  // change to *2 when 16 bit 
+      }
+      else {
+	  /* read until we get something smaller than a full buffer */
+	  while ((j = read(fd, buffer, sizeof(buffer))) == sizeof(buffer));
+      }
   } else {
-
-    /* XXX this ends up discarding everything after a complete read */
-    j = read(fd, buffer, sizeof(buffer));
-
+      if (pcm != NULL) {
+	  fprintf(stderr, "ALSA2 read(%d)\n", frames);
+	  j = snd_pcm_readi(pcm, buffer, frames);
+	  fprintf(stderr, "ALSA2 read = %d\n", j);
+	  if (j > 0) j *= sc_chans * 1;  // change to *2 when 16 bit 
+      }
+      else
+	  j = read(fd, buffer, sizeof(buffer));
   }
 
+  if ((j < 0) && (j == -EAGAIN)) {
+      memset(buffer, 200, frames*sc_chans*1);
+      j = frames*sc_chans;
+  }
   i = 0;
 
   if (!in_progress) {
@@ -423,7 +551,7 @@ get_data()
 
   if (in_progress >= left_sig.width) in_progress = 0;
 
-  return(1);
+  return 1;
 }
 
 static char * snd_status_str(int i)
@@ -552,6 +680,47 @@ static char * sc_save_option(int i)
     return NULL;
   }
 }
+
+#ifdef HAVE_ASOUND
+
+static char * asound_status_str(int i)
+{
+  switch (i) {
+  case 0:
+    if (asound_errormsg1) return asound_errormsg1;
+    else return "";
+  case 2:
+    if (asound_errormsg2) return asound_errormsg2;
+    else return "";
+  }
+  return NULL;
+}
+#endif
+
+#ifdef HAVE_ASOUND
+DataSrc datasrc_asound = {
+  "ALSA",
+  asound_nchans,
+  sc_chan,
+  set_trigger,
+  clear_trigger,
+  change_rate,
+  set_width,
+  reset,
+  fd,
+  get_data,
+  asound_status_str,
+  NULL,  /* option1, */
+  NULL,  /* option1str, */
+  NULL,  /* option2, */
+  NULL,  /* option2str, */
+  sc_set_option,
+  sc_save_option,
+  NULL,  /* gtk_options */
+};
+#endif
+
+
 
 #ifdef HAVE_LIBESD
 DataSrc datasrc_esd = {

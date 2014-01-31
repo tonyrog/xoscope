@@ -213,3 +213,5 @@
 
 /* preferred path to bitscope serial device ("/dev/bitscope") */
 #define BITSCOPE "/dev/bitscope"
+
+#define HAVE_ASOUND

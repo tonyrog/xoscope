@@ -29,6 +29,9 @@ extern DataSrc datasrc_esd;
 #ifdef HAVE_LIBCOMEDI
 extern DataSrc datasrc_comedi;
 #endif
+#ifdef HAVE_ASOUND
+extern DataSrc datasrc_asound;
+#endif
 
 DataSrc *datasrcs[] = {
 #ifdef HAVE_LIBCOMEDI
@@ -36,6 +39,9 @@ DataSrc *datasrcs[] = {
 #endif
 #ifdef HAVE_LIBESD
   &datasrc_esd,
+#endif
+#ifdef HAVE_ASOUND
+  &datasrc_asound,
 #endif
   &datasrc_sc,
   &datasrc_ps,
