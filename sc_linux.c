@@ -39,16 +39,17 @@
 #define ASOUNDDEV   "hw:0,0"
 
 static int snd = -2;		/* file descriptor for /dev/dsp */
-static int esd = -2;		/* file descriptor for ESD */
 
 #ifdef HAVE_LIBESD
 static int esdblock = 0;	/* 1 to block ESD; 0 to non-block */
 static int esdrecord = 0;	/* 1 to use ESD record mode; 0 to use ESD monitor mode */
+static int esd = -2;		/* file descriptor for ESD */
 #endif
 
 #ifdef HAVE_ASOUND
 snd_pcm_t* pcm = NULL;
 snd_pcm_hw_params_t* params = NULL;
+snd_pcm_uframes_t pcm_frames = 32;
 #endif
 
 
@@ -171,7 +172,6 @@ static void close_asound()
 static int open_asound(void)
 {
     int rc;
-    snd_pcm_uframes_t frames;
     int chans = 2;
     unsigned int val;
     unsigned int rate;
@@ -209,8 +209,7 @@ static int open_asound(void)
     sound_card_rate = 8000;
     val = sound_card_rate;
     snd_pcm_hw_params_set_rate_near(pcm, params, &val, 0);
-    frames = 32;
-    snd_pcm_hw_params_set_period_size_near(pcm, params, &frames, 0);
+    snd_pcm_hw_params_set_period_size_near(pcm, params, &pcm_frames, 0);
 
     snd_pcm_hw_params_get_channels(params, &val);
     fprintf(stderr, "channels = %d\n", val);
@@ -277,44 +276,37 @@ open_sound_card(void)
   return 1;
 }
 
-static void
+static int
 reset_sound_card(void)
 {
-  static char junk[SAMPLESKIP];
+    static char junk[SAMPLESKIP];
 
 #ifdef HAVE_LIBESD
-  if (esd >= 0) {
-
-    close_ESD();
-    open_ESD();
-
-    if (esd < 0) return;
-
-    read(esd, junk, SAMPLESKIP);
-
-    return;
-  }
+    if (esd >= 0) {
+	close_ESD();
+	open_ESD();
+	if (esd < 0) return;
+	return read(esd, junk, SAMPLESKIP);
+    }
 #endif
 
 #ifdef HAVE_ASOUND
-  if (pcm != NULL) {
-      close_asound();
-      open_asound();
-      // if (pcm != NULL) snd_pcm_drain(pcm);
-      fprintf(stderr, "ALSO reset done\n");
-  }
+    if (pcm != NULL) {
+	close_asound();
+	open_asound();
+	// if (pcm != NULL) snd_pcm_drain(pcm);
+	fprintf(stderr, "ALSO reset done\n");
+	return 0;
+    }
 #endif
 
-
-  if (snd >= 0) {
-
-    close_sound_card();
-    open_sound_card();
-
-    if (snd < 0) return;
-
-    read(snd, junk, SAMPLESKIP);
-  }
+    if (snd >= 0) {
+	close_sound_card();
+	open_sound_card();
+	if (snd < 0) return 0;
+	return read(snd, junk, SAMPLESKIP);
+    }
+    return 0;
 }
 
 #ifdef HAVE_LIBESD
@@ -328,14 +320,36 @@ static int esd_nchans(void)
   return (esd >= 0) ? 2 : 0;
 }
 
+static int esd_fd(void)
+{
+    return esd;
+}
+
 #endif
 
+
 #ifdef HAVE_ASOUND
+
 static int asound_nchans(void)
 {
     if (pcm == NULL) open_asound();
     return (pcm != NULL) ? sc_chans : 0;
 }
+
+static int asound_fd(void)
+{
+    if (pcm != NULL) {
+	struct pollfd fds[1];
+	int n = snd_pcm_poll_descriptors_count(pcm);
+	if (n >= 1) {
+	    if (snd_pcm_poll_descriptors(pcm, fds, 1) < 0)
+		return -1;
+	    return fds[0].fd;
+	}
+    }
+    return -1;
+}
+
 #endif
 
 static int sc_nchans(void)
@@ -344,9 +358,9 @@ static int sc_nchans(void)
   return (snd >= 0) ? sc_chans : 0;
 }
 
-static int fd(void)
+static int sc_fd(void)
 {
-  return (snd >= 0) ? snd : esd;
+    return snd;
 }
 
 static Signal *sc_chan(int chan)
@@ -383,8 +397,6 @@ static int change_rate(int dir)
 {
   int newrate = sound_card_rate;
 
-  if (esd >= 0) return 0;
-
   if (dir > 0) {
     if (sound_card_rate > 16500)
       newrate = 44100;
@@ -408,10 +420,17 @@ static int change_rate(int dir)
   return 0;
 }
 
+#ifdef HAVE_LIBESD
+static int esd_change_rate(int dir)
+{
+    return 0;
+}
+#endif
+
 static void
 reset(void)
 {
-  reset_sound_card();
+    reset_sound_card();
 
 #ifdef HAVE_LIBESD
   left_sig.rate = esd >= 0 ? ESD_DEFAULT_RATE : sound_card_rate;
@@ -446,113 +465,250 @@ static void set_width(int width)
   right_sig.data = malloc(width * sizeof(short));
 }
 
-/* get data from sound card, return value is whether we triggered or not */
-static int
-get_data()
+/*
+ * check for trigger in among interleaved channels
+ */
+static int trigger_rising(unsigned char* buffer, int ns, 
+			  int nchannels, int chan, int level)
 {
-  static unsigned char buffer[MAXWID * 2];
-  static int i, j, delay;
-  snd_pcm_uframes_t frames = 32;
-  int fd;
-
-  if (snd >= 0) fd = snd;
-  else if (esd >= 0) fd = esd;
-  else if (pcm != NULL) fd=-1;
-  else return (0);
-
-  if (!in_progress) {
-    /* Discard excess samples so we can keep our time snapshot close
-       to real-time and minimize sound recording overruns.  For ESD we
-       don't know how many are available (do we?) so we discard them
-       all to start with a fresh buffer that hopefully won't wrap
-       around before we get it read. */
-      
-      if (pcm != NULL) {
-	  // snd_pcm_drain(pcm);
-	  fprintf(stderr, "ALSA1 read(%d)\n", frames);
-	  j = snd_pcm_readi(pcm, buffer, frames);
-	  fprintf(stderr, "ALSA1 read = %d\n", j);
-	  if (j > 0) j *= sc_chans * 1;  // change to *2 when 16 bit 
-      }
-      else {
-	  /* read until we get something smaller than a full buffer */
-	  while ((j = read(fd, buffer, sizeof(buffer))) == sizeof(buffer));
-      }
-  } else {
-      if (pcm != NULL) {
-	  fprintf(stderr, "ALSA2 read(%d)\n", frames);
-	  j = snd_pcm_readi(pcm, buffer, frames);
-	  fprintf(stderr, "ALSA2 read = %d\n", j);
-	  if (j > 0) j *= sc_chans * 1;  // change to *2 when 16 bit 
-      }
-      else
-	  j = read(fd, buffer, sizeof(buffer));
-  }
-
-  if ((j < 0) && (j == -EAGAIN)) {
-      memset(buffer, 200, frames*sc_chans*1);
-      j = frames*sc_chans;
-  }
-  i = 0;
-
-  if (!in_progress) {
-
-    if (trigmode == 1) {
-      i ++;
-      while (((i+1)*2 <= j) && ((buffer[2*i + trigch] < triglev) ||
-				(buffer[2*(i-1) + trigch] >= triglev))) i ++;
-    } else if (trigmode == 2) {
-      i ++;
-      while (((i+1)*2 <= j) && ((buffer[2*i + trigch] > triglev) ||
-				(buffer[2*(i-1) + trigch] <= triglev))) i ++;
+    int n = nchannels*ns;
+    int i = 0;
+    while(i < n) {
+	int j = i + nchannels;
+	if ((buffer[i+chan] < level) && (buffer[j+chan] >= level))
+	    return i;
+	i = j;
     }
-
-    if ((i+1)*2 > j)		/* haven't triggered within the screen */
-      return(0);		/* give up and keep previous samples */
-
-    delay = 0;
-
-    if (trigmode) {
-      int last = buffer[2*(i-1) + trigch] - 127;
-      int current = buffer[2*i + trigch] - 127;
-      if (last != current)
-	delay = abs(10000 * (current - (triglev - 127)) / (current - last));
-    }
-
-    left_sig.data[0] = buffer[2*i] - 127;
-    left_sig.delay = delay;
-    left_sig.num = 1;
-    left_sig.frame ++;
-
-    right_sig.data[0] = buffer[2*i + 1] - 127;
-    right_sig.delay = delay;
-    right_sig.num = 1;
-    right_sig.frame ++;
-
-    i ++;
-    in_progress = 1;
-  }
-
-  while ((i+1)*2 <= j) {
-    if (in_progress >= left_sig.width) break;
-#if 0
-    if (*buff == 0 || *buff == 255)
-      clip = i % 2 + 1;
-#endif
-    left_sig.data[in_progress] = buffer[2*i] - 127;
-    right_sig.data[in_progress] = buffer[2*i + 1] - 127;
-
-    in_progress ++;
-    i ++;
-  }
-
-  left_sig.num = in_progress;
-  right_sig.num = in_progress;
-
-  if (in_progress >= left_sig.width) in_progress = 0;
-
-  return 1;
+    return -1;
 }
+
+static int trigger_falling(unsigned char* buffer, int ns, 
+			   int nchannels, int chan, int level)
+{
+    int n = nchannels*ns;
+    int i = 0;
+    while(i < n) {
+	int j = i + nchannels;
+	if ((buffer[i+chan] >= level) && (buffer[j+chan] < level))
+	    return i;
+	i = j;
+    }
+    return -1;
+}
+
+static int trigger_both(unsigned char* buffer, int ns, 
+			int nchannels, int chan, int level)
+{
+    int n = nchannels*ns;
+    int i = 0;
+    while(i <= n) {
+	int j = i + nchannels;
+	if (((buffer[i+chan] >= level) && (buffer[j+chan] < level)) ||
+	    ((buffer[i+chan] <  level) && (buffer[j+chan] >= level)))
+	    return i;
+	i = j;
+    }
+    return -1;
+}
+
+/*
+ * Common data load function 
+ */
+static int load_data(unsigned char* buffer, int ns, int nchannels,
+		     int* nump, int width)
+{
+    int n = nchannels*ns;
+    int i = 0;
+    int j = *nump;
+
+    switch(nchannels) {
+    case 0:
+	break;
+    case 1:
+	while((i < n) && (j < width)) {
+	    left_sig.data[j] = buffer[i] - 127;
+	    right_sig.data[j] = 0;
+	    i++;
+	    j++;
+	}
+	break;
+    case 2:
+	while((i < n) && (j < width)) {
+	    left_sig.data[j]  = buffer[i] - 127;
+	    right_sig.data[j] = buffer[i+1] - 127;
+	    i += 2;
+	    j++;
+	}
+	break;
+    default:
+	break;
+    }
+    *nump = j;
+    left_sig.num = j;
+    right_sig.num = j;
+    if (j >= width) *nump = 0;
+    return 1;
+}
+
+static int do_get_data(unsigned char* ptr, int ns)
+{
+    if (!in_progress) {
+	int i;
+	switch(trigmode) {
+	case 1:
+	    if ((i=trigger_falling(ptr,ns,sc_chans,trigch,triglev)) < 0)
+		return 0;
+	    break;
+	case 2:
+	    if ((i=trigger_rising(ptr,ns,sc_chans,trigch,triglev)) < 0)
+		return 0;
+	    break;
+	case 3:
+	    if ((i = trigger_both(ptr,ns,sc_chans,trigch,triglev)) < 0)
+		return 0;
+	    break;
+	default:
+	    i = 0;
+	    break;
+	}
+	ptr += i;
+	ns  -= i;
+
+	if (trigmode) {
+	    // not 100% correct! fixme use real dubble buffer
+	    switch(sc_chans) {
+	    case 1: {
+		int a = ptr[0] - 127;
+		int b = ptr[1] - 127;
+		int delay = 0;
+		if (a != b) // ????
+		    delay = abs(10000*(b-(triglev-127)) / (b-a));
+		left_sig.data[0] = ptr[0] - 127;
+		left_sig.delay = delay;
+		left_sig.num = 1;
+		left_sig.frame ++;
+		
+		right_sig.data[0] = 0;
+		right_sig.delay = delay;
+		right_sig.num = 1;
+		right_sig.frame ++;
+		
+		ptr += 1;
+		ns--;
+		break;
+	    }
+	    case 2: {
+		int a = ptr[trigch] - 127;
+		int b = ptr[2 + trigch] - 127;
+		int delay = 0;
+		if (a != b) // ????
+		    delay = abs(10000*(b-(triglev-127)) / (b-a));
+		left_sig.data[0] = ptr[0] - 127;
+		left_sig.delay = delay;
+		left_sig.num = 1;
+		left_sig.frame ++;
+		
+		right_sig.data[0] = ptr[1] - 127;
+		right_sig.delay = delay;
+		right_sig.num = 1;
+		right_sig.frame ++;
+		ptr += 2;
+		ns--;
+		break;
+	    }
+	    default:
+		break;
+	    }
+	}
+	in_progress = 1;
+    }
+    return load_data(ptr, ns, sc_chans, &in_progress, left_sig.width);
+}
+
+#ifdef HAVE_ASOUND
+/* get data from sound card, return value is whether we triggered or not */
+static int asound_get_data()
+{
+    static unsigned char buffer[MAXWID * 2];
+    int ns;
+
+    // assert that sizeof(buffer) > pcm_frames*sc_chans*1 
+
+    if (pcm == NULL) return 0;
+
+    if (!in_progress) {
+	// snd_pcm_drain(pcm);
+	fprintf(stderr, "ALSA1 read(%d)\n", (int)pcm_frames);
+	ns = snd_pcm_readi(pcm, buffer, pcm_frames);
+	fprintf(stderr, "ALSA1 read = %d\n", ns);
+    } 
+    else {
+	fprintf(stderr, "ALSA2 read(%d)\n", (int)pcm_frames);
+	ns = snd_pcm_readi(pcm, buffer, pcm_frames);
+	fprintf(stderr, "ALSA2 read = %d\n", ns);
+    }
+
+    // fixme: this is just for testing
+    if ((ns < 0) && (errno == -EAGAIN)) {
+	memset(buffer, 200, pcm_frames*sc_chans*1);
+	ns = 0;
+    }
+
+    return do_get_data(buffer, ns);
+}
+#endif
+
+#ifdef HAVE_LIBESD
+/* get data from sound card, return value is whether we triggered or not */
+static int get_data()
+{
+    static unsigned char buffer[MAXWID * 2];
+    int ns;
+
+    if (esd < 0) 
+	return 0;
+    if (!in_progress) {
+	/* Discard excess samples so we can keep our time snapshot close
+	   to real-time and minimize sound recording overruns.  For ESD we
+	   don't know how many are available (do we?) so we discard them
+	   all to start with a fresh buffer that hopefully won't wrap
+	   around before we get it read. */
+	
+	/* read until we get something smaller than a full buffer */
+	while ((ns = read(esd, buffer, sizeof(buffer))) == sizeof(buffer));
+    } else {
+	ns = read(esd, buffer, sizeof(buffer));
+    }
+    ns = (ns < 0) ? 0 : (ns / sc_chans);
+    return do_get_data(buffer, ns);
+}
+#endif
+
+/* get data from sound card, return value is whether we triggered or not */
+static int sc_get_data()
+{
+    static unsigned char buffer[MAXWID * 2];
+    int ns;
+
+    if (snd < 0)
+	return 0;
+    if (!in_progress) {
+	/* Discard excess samples so we can keep our time snapshot close
+	   to real-time and minimize sound recording overruns.  For ESD we
+	   don't know how many are available (do we?) so we discard them
+	   all to start with a fresh buffer that hopefully won't wrap
+	   around before we get it read. */
+	
+	/* read until we get something smaller than a full buffer */
+	while ((ns = read(snd, buffer, sizeof(buffer))) == sizeof(buffer));
+    } else {
+	ns = read(snd, buffer, sizeof(buffer));
+    }
+    ns = (ns < 0) ? 0 : (ns / sc_chans);
+    return do_get_data(buffer, ns);
+}
+
+
 
 static char * snd_status_str(int i)
 {
@@ -707,8 +863,8 @@ DataSrc datasrc_asound = {
   change_rate,
   set_width,
   reset,
-  fd,
-  get_data,
+  asound_fd,
+  asound_get_data,
   asound_status_str,
   NULL,  /* option1, */
   NULL,  /* option1str, */
@@ -729,11 +885,11 @@ DataSrc datasrc_esd = {
   sc_chan,
   set_trigger,
   clear_trigger,
-  change_rate,
+  esd_change_rate,
   set_width,
   reset,
-  fd,
-  get_data,
+  esd_fd,
+  esd_get_data,
   esd_status_str,
   option1_esd,  /* option1 */
   option1str_esd,  /* option1str */
@@ -754,8 +910,8 @@ DataSrc datasrc_sc = {
   change_rate,
   set_width,
   reset,
-  fd,
-  get_data,
+  sc_fd,
+  sc_get_data,
   snd_status_str,
 #ifdef DEBUG
   NULL,
