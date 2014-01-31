@@ -50,6 +50,9 @@ static int esd = -2;		/* file descriptor for ESD */
 snd_pcm_t* pcm = NULL;
 snd_pcm_hw_params_t* params = NULL;
 snd_pcm_uframes_t pcm_frames = 32;
+struct pollfd* pcm_fds = NULL;
+int n_pcm_fds = 0;
+int a_pcm_fds = 0;
 #endif
 
 
@@ -206,7 +209,7 @@ static int open_asound(void)
     sc_chans = chans;
     snd_pcm_hw_params_set_channels(pcm, params, chans);
 
-    sound_card_rate = 8000;
+    sound_card_rate = 8000; // 44100; // 8000;
     val = sound_card_rate;
     snd_pcm_hw_params_set_rate_near(pcm, params, &val, 0);
     snd_pcm_hw_params_set_period_size_near(pcm, params, &pcm_frames, 0);
@@ -339,12 +342,17 @@ static int asound_nchans(void)
 static int asound_fd(void)
 {
     if (pcm != NULL) {
-	struct pollfd fds[1];
 	int n = snd_pcm_poll_descriptors_count(pcm);
-	if (n >= 1) {
-	    if (snd_pcm_poll_descriptors(pcm, fds, 1) < 0)
+	if (n > a_pcm_fds) {
+	    pcm_fds = realloc(pcm_fds, n*sizeof(struct pollfd));
+	    a_pcm_fds = n;
+	}
+	printf("#pollfd = %d\n", n);
+	if ((n_pcm_fds = n) > 0) {
+	    if (snd_pcm_poll_descriptors(pcm, pcm_fds, n_pcm_fds) < 0)
 		return -1;
-	    return fds[0].fd;
+	    printf("#fd[0] = %d\n", pcm_fds[0].fd);
+	    return pcm_fds[0].fd;
 	}
     }
     return -1;
@@ -553,6 +561,7 @@ static int load_data(unsigned char* buffer, int ns, int nchannels,
 static int do_get_data(unsigned char* ptr, int ns)
 {
     if (!in_progress) {
+	int delay = 0;
 	int i;
 	switch(trigmode) {
 	case 1:
@@ -576,50 +585,43 @@ static int do_get_data(unsigned char* ptr, int ns)
 
 	if (trigmode) {
 	    // not 100% correct! fixme use real dubble buffer
-	    switch(sc_chans) {
-	    case 1: {
-		int a = ptr[0] - 127;
-		int b = ptr[1] - 127;
-		int delay = 0;
-		if (a != b) // ????
-		    delay = abs(10000*(b-(triglev-127)) / (b-a));
-		left_sig.data[0] = ptr[0] - 127;
-		left_sig.delay = delay;
-		left_sig.num = 1;
-		left_sig.frame ++;
-		
-		right_sig.data[0] = 0;
-		right_sig.delay = delay;
-		right_sig.num = 1;
-		right_sig.frame ++;
-		
-		ptr += 1;
-		ns--;
-		break;
-	    }
-	    case 2: {
-		int a = ptr[trigch] - 127;
-		int b = ptr[2 + trigch] - 127;
-		int delay = 0;
-		if (a != b) // ????
-		    delay = abs(10000*(b-(triglev-127)) / (b-a));
-		left_sig.data[0] = ptr[0] - 127;
-		left_sig.delay = delay;
-		left_sig.num = 1;
-		left_sig.frame ++;
-		
-		right_sig.data[0] = ptr[1] - 127;
-		right_sig.delay = delay;
-		right_sig.num = 1;
-		right_sig.frame ++;
-		ptr += 2;
-		ns--;
-		break;
-	    }
-	    default:
-		break;
-	    }
+	    int a = ptr[trigch] - 127;
+	    int b = ptr[sc_chans+trigch] - 127;
+	    if (a != b) // ????
+		delay = abs(10000*(b-(triglev-127)) / (b-a));
 	}
+
+	switch(sc_chans) {
+	case 1:
+	    left_sig.data[0] = ptr[0] - 127;
+	    left_sig.delay = delay;
+	    left_sig.num = 1;
+	    left_sig.frame ++;
+		
+	    right_sig.data[0] = 0;
+	    right_sig.delay = delay;
+	    right_sig.num = 1;
+	    right_sig.frame ++;
+	    ptr += 1;
+	    ns--;
+	    break;
+	case 2:
+	    left_sig.data[0] = ptr[0] - 127;
+	    left_sig.delay = delay;
+	    left_sig.num = 1;
+	    left_sig.frame ++;
+		
+	    right_sig.data[0] = ptr[1] - 127;
+	    right_sig.delay = delay;
+	    right_sig.num = 1;
+	    right_sig.frame ++;
+	    ptr += 2;
+	    ns--;	    
+	    break;
+	default:
+	    break;
+	}
+	printf("frame=%d\n", left_sig.frame);
 	in_progress = 1;
     }
     return load_data(ptr, ns, sc_chans, &in_progress, left_sig.width);
@@ -631,29 +633,28 @@ static int asound_get_data()
 {
     static unsigned char buffer[MAXWID * 2];
     int ns;
-
+    unsigned short revents;
+    
     // assert that sizeof(buffer) > pcm_frames*sc_chans*1 
 
     if (pcm == NULL) return 0;
 
-    if (!in_progress) {
-	// snd_pcm_drain(pcm);
-	fprintf(stderr, "ALSA1 read(%d)\n", (int)pcm_frames);
-	ns = snd_pcm_readi(pcm, buffer, pcm_frames);
-	fprintf(stderr, "ALSA1 read = %d\n", ns);
-    } 
-    else {
-	fprintf(stderr, "ALSA2 read(%d)\n", (int)pcm_frames);
-	ns = snd_pcm_readi(pcm, buffer, pcm_frames);
-	fprintf(stderr, "ALSA2 read = %d\n", ns);
+    snd_pcm_poll_descriptors_revents(pcm, pcm_fds, n_pcm_fds, &revents);
+    if (!(revents & POLLIN)) {
+	printf("no poll\n");
+	return 1;
+	// return in_progress;
     }
+    if (!in_progress)
+	snd_pcm_drain(pcm);
+    ns = snd_pcm_readi(pcm, buffer, pcm_frames);
 
     // fixme: this is just for testing
-    if ((ns < 0) && (errno == -EAGAIN)) {
-	memset(buffer, 200, pcm_frames*sc_chans*1);
-	ns = 0;
+    if (ns < 0) {
+	if (errno == EAGAIN)
+	    return 1;
+	return 0;
     }
-
     return do_get_data(buffer, ns);
 }
 #endif
