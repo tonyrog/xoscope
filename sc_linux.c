@@ -48,11 +48,13 @@ static int esd = -2;		/* file descriptor for ESD */
 
 #ifdef HAVE_ASOUND
 snd_pcm_t* pcm = NULL;
-snd_pcm_hw_params_t* params = NULL;
 snd_pcm_uframes_t pcm_frames = 32;
+snd_pcm_uframes_t pcm_samples = 32;
 struct pollfd* pcm_fds = NULL;
 int n_pcm_fds = 0;
 int a_pcm_fds = 0;
+snd_pcm_uframes_t pcm_buffer_size;
+snd_pcm_uframes_t pcm_period_size;
 #endif
 
 
@@ -166,24 +168,20 @@ static void close_asound()
 	snd_pcm_close(pcm);
 	pcm = NULL;
     }
-    if (params != NULL) {
-	// snd_pcm_hw_params_free(params);
-	params = NULL;
-    }
 }
 
 static int open_asound(void)
 {
     int rc;
-    int chans = 2;
     unsigned int val;
     unsigned int rate;
     snd_pcm_format_t format;
+    snd_pcm_hw_params_t* params = NULL;
 
     if (pcm != NULL)
 	return 1;
     rc = snd_pcm_open(&pcm, ASOUNDDEV, SND_PCM_STREAM_CAPTURE, 
-		      SND_PCM_NONBLOCK);
+		      0); // SND_PCM_NONBLOCK);
     fprintf(stderr, "ALSA open = %d, pcm=%p\n", rc, pcm);
     if (rc < 0) {
 	asound_errormsg1 = "opening " ASOUNDDEV;
@@ -195,33 +193,31 @@ static int open_asound(void)
 
     snd_pcm_hw_params_set_rate_resample(pcm, params, 1);
 
-    // read default values and print them
-    snd_pcm_hw_params_get_channels(params, &val);
-    fprintf(stderr, "default channels = %d\n", val);
-    snd_pcm_hw_params_get_format(params, &format);
-    fprintf(stderr, "default format = %s\n", snd_pcm_format_name(format));
-    snd_pcm_hw_params_get_rate(params, &rate, 0);
-    fprintf(stderr, "default rate = %u\n", rate);
+    snd_pcm_hw_params_set_access(pcm, params,
+				 SND_PCM_ACCESS_RW_INTERLEAVED);
+    snd_pcm_hw_params_set_format(pcm, params, 
+				 SND_PCM_FORMAT_S8); // S16_LE);
 
-    snd_pcm_hw_params_set_access(pcm, params, SND_PCM_ACCESS_RW_INTERLEAVED);
-    snd_pcm_hw_params_set_format(pcm, params, SND_PCM_FORMAT_S8); // S16_LE);
+    sc_chans = 2;
+    snd_pcm_hw_params_set_channels(pcm, params, sc_chans);
 
-    sc_chans = chans;
-    snd_pcm_hw_params_set_channels(pcm, params, chans);
-
-    sound_card_rate = 8000; // 44100; // 8000;
+    sound_card_rate = 44100; // 8000;
     val = sound_card_rate;
     snd_pcm_hw_params_set_rate_near(pcm, params, &val, 0);
     snd_pcm_hw_params_set_period_size_near(pcm, params, &pcm_frames, 0);
 
     snd_pcm_hw_params_get_channels(params, &val);
-    fprintf(stderr, "channels = %d\n", val);
     snd_pcm_hw_params_get_format(params, &format);
-    fprintf(stderr, "format = %s\n", snd_pcm_format_name(format));
     snd_pcm_hw_params_get_rate(params, &rate, 0);
+
+    fprintf(stderr, "channels = %d\n", val);
+    fprintf(stderr, "format = %s\n", snd_pcm_format_name(format));
     fprintf(stderr, "rate = %u\n", rate);
 
     rc = snd_pcm_hw_params(pcm, params);
+
+    // snd_pcm_hw_params_free(params);
+    
     // rc = 0;
     fprintf(stderr, "ALSO open = %d\n", rc);
     if (rc < 0) {
@@ -230,6 +226,31 @@ static int open_asound(void)
 	snd_pcm_close(pcm);
 	return 0;
     }
+    if ((rc=snd_pcm_prepare(pcm)) < 0) {
+	fprintf(stderr, "ALSA prepare = %d\n", rc);
+	asound_errormsg1 = "set hw " ASOUNDDEV;
+	asound_errormsg2 = (char*) snd_strerror(rc);
+	snd_pcm_close(pcm);
+	return 0;
+    }
+    if ((rc=snd_pcm_start(pcm)) < 0) {
+	fprintf(stderr, "ALSA start = %d\n", rc);
+	asound_errormsg1 = "set hw " ASOUNDDEV;
+	asound_errormsg2 = (char*) snd_strerror(rc);
+	snd_pcm_close(pcm);
+	return 0;
+    }
+
+    snd_pcm_get_params(pcm, &pcm_buffer_size, &pcm_period_size);
+    pcm_samples = rate / 20;
+    pcm_samples  = (pcm_samples / pcm_period_size)*pcm_period_size;
+    if (pcm_samples < pcm_period_size)
+	pcm_samples = pcm_period_size;
+
+
+    fprintf(stderr, "buffer_size = %d\n", (int) pcm_buffer_size);
+    fprintf(stderr, "period_size = %d\n", (int) pcm_period_size);
+    fprintf(stderr, "pcm_samples = %d\n", (int) pcm_samples);
 
     return 1;
 }
@@ -347,11 +368,11 @@ static int asound_fd(void)
 	    pcm_fds = realloc(pcm_fds, n*sizeof(struct pollfd));
 	    a_pcm_fds = n;
 	}
-	printf("#pollfd = %d\n", n);
+	// printf("#pollfd = %d\n", n);
 	if ((n_pcm_fds = n) > 0) {
 	    if (snd_pcm_poll_descriptors(pcm, pcm_fds, n_pcm_fds) < 0)
 		return -1;
-	    printf("#fd[0] = %d\n", pcm_fds[0].fd);
+	    // printf("#fd[0] = %d\n", pcm_fds[0].fd);
 	    return pcm_fds[0].fd;
 	}
     }
@@ -522,14 +543,14 @@ static int trigger_both(unsigned char* buffer, int ns,
 /*
  * Common data load function 
  */
-static int load_data(unsigned char* buffer, int ns, int nchannels,
+static int load_data(unsigned char* buffer, int ns, int nchan,
 		     int* nump, int width)
 {
-    int n = nchannels*ns;
+    int n = nchan*ns;
     int i = 0;
     int j = *nump;
 
-    switch(nchannels) {
+    switch(nchan) {
     case 0:
 	break;
     case 1:
@@ -558,22 +579,22 @@ static int load_data(unsigned char* buffer, int ns, int nchannels,
     return 1;
 }
 
-static int do_get_data(unsigned char* ptr, int ns)
+static int process_samples(unsigned char* ptr, int ns, int nchan)
 {
     if (!in_progress) {
 	int delay = 0;
 	int i;
 	switch(trigmode) {
 	case 1:
-	    if ((i=trigger_falling(ptr,ns,sc_chans,trigch,triglev)) < 0)
+	    if ((i=trigger_falling(ptr,ns,nchan,trigch,triglev)) < 0)
 		return 0;
 	    break;
 	case 2:
-	    if ((i=trigger_rising(ptr,ns,sc_chans,trigch,triglev)) < 0)
+	    if ((i=trigger_rising(ptr,ns,nchan,trigch,triglev)) < 0)
 		return 0;
 	    break;
 	case 3:
-	    if ((i = trigger_both(ptr,ns,sc_chans,trigch,triglev)) < 0)
+	    if ((i = trigger_both(ptr,ns,nchan,trigch,triglev)) < 0)
 		return 0;
 	    break;
 	default:
@@ -586,12 +607,12 @@ static int do_get_data(unsigned char* ptr, int ns)
 	if (trigmode) {
 	    // not 100% correct! fixme use real dubble buffer
 	    int a = ptr[trigch] - 127;
-	    int b = ptr[sc_chans+trigch] - 127;
+	    int b = ptr[nchan+trigch] - 127;
 	    if (a != b) // ????
 		delay = abs(10000*(b-(triglev-127)) / (b-a));
 	}
 
-	switch(sc_chans) {
+	switch(nchan) {
 	case 1:
 	    left_sig.data[0] = ptr[0] - 127;
 	    left_sig.delay = delay;
@@ -621,10 +642,9 @@ static int do_get_data(unsigned char* ptr, int ns)
 	default:
 	    break;
 	}
-	printf("frame=%d\n", left_sig.frame);
 	in_progress = 1;
     }
-    return load_data(ptr, ns, sc_chans, &in_progress, left_sig.width);
+    return load_data(ptr, ns, nchan, &in_progress, left_sig.width);
 }
 
 #ifdef HAVE_ASOUND
@@ -633,29 +653,40 @@ static int asound_get_data()
 {
     static unsigned char buffer[MAXWID * 2];
     int ns;
-    unsigned short revents;
-    
+    // unsigned short revents;
+    // static int call = 0;
+    static int r = 0;
+
     // assert that sizeof(buffer) > pcm_frames*sc_chans*1 
 
     if (pcm == NULL) return 0;
 
-    snd_pcm_poll_descriptors_revents(pcm, pcm_fds, n_pcm_fds, &revents);
-    if (!(revents & POLLIN)) {
-	printf("no poll\n");
-	return 1;
-	// return in_progress;
-    }
-    if (!in_progress)
-	snd_pcm_drain(pcm);
-    ns = snd_pcm_readi(pcm, buffer, pcm_frames);
+    // snd_pcm_poll_descriptors_revents(pcm, pcm_fds, n_pcm_fds, &revents);
+     // if (!(revents & POLLIN)) printf("no poll\n");
 
-    // fixme: this is just for testing
-    if (ns < 0) {
-	if (errno == EAGAIN)
-	    return 1;
-	return 0;
+//    if (!in_progress)
+//	snd_pcm_drain(pcm);
+
+    if ((ns = snd_pcm_readi(pcm, buffer, pcm_samples)) == -EPIPE) {
+	fprintf(stderr, "overrun : %s\n", snd_strerror(ns));
+	snd_pcm_prepare(pcm);
+	ns = snd_pcm_readi(pcm, buffer, pcm_samples);
     }
-    return do_get_data(buffer, ns);
+    if (ns < 0) {
+	fprintf(stderr, "error readi: %s\n", snd_strerror(ns));
+	snd_pcm_recover(pcm,ns,0);
+	snd_pcm_drain(pcm);
+	return in_progress;
+    }
+    else if (ns < pcm_samples) {
+	fprintf(stderr, "short readi: %d\n", ns);
+	snd_pcm_recover(pcm,ns,0);
+	snd_pcm_drain(pcm);
+	return in_progress;
+    }
+    r = process_samples(buffer, pcm_samples, sc_chans);
+    // printf("r=%d, call:%d frame:%d\n", r, call++, left_sig.frame);
+    return r;
 }
 #endif
 
@@ -681,7 +712,7 @@ static int get_data()
 	ns = read(esd, buffer, sizeof(buffer));
     }
     ns = (ns < 0) ? 0 : (ns / sc_chans);
-    return do_get_data(buffer, ns);
+    return process_samples(buffer, ns, sc_chans);
 }
 #endif
 
@@ -706,7 +737,7 @@ static int sc_get_data()
 	ns = read(snd, buffer, sizeof(buffer));
     }
     ns = (ns < 0) ? 0 : (ns / sc_chans);
-    return do_get_data(buffer, ns);
+    return process_samples(buffer, ns, sc_chans);
 }
 
 
