@@ -177,6 +177,7 @@ static int open_asound(void)
     unsigned int rate;
     snd_pcm_format_t format;
     snd_pcm_hw_params_t* params = NULL;
+    snd_pcm_uframes_t buffer_size;
 
     if (pcm != NULL)
 	return 1;
@@ -205,6 +206,15 @@ static int open_asound(void)
     val = sound_card_rate;
     snd_pcm_hw_params_set_rate_near(pcm, params, &val, 0);
     snd_pcm_hw_params_set_period_size_near(pcm, params, &pcm_frames, 0);
+
+    pcm_samples = val / 20;  // 20 frames / sec
+    pcm_samples  = (pcm_samples / pcm_frames)*pcm_frames;
+    if (pcm_samples < pcm_frames)
+	pcm_samples = pcm_frames;
+
+    buffer_size = pcm_samples; // pcm_samples * 2;
+    snd_pcm_hw_params_set_buffer_size_max(pcm, params, &buffer_size);
+
 
     snd_pcm_hw_params_get_channels(params, &val);
     snd_pcm_hw_params_get_format(params, &format);
@@ -242,11 +252,6 @@ static int open_asound(void)
     }
 
     snd_pcm_get_params(pcm, &pcm_buffer_size, &pcm_period_size);
-    pcm_samples = rate / 20;
-    pcm_samples  = (pcm_samples / pcm_period_size)*pcm_period_size;
-    if (pcm_samples < pcm_period_size)
-	pcm_samples = pcm_period_size;
-
 
     fprintf(stderr, "buffer_size = %d\n", (int) pcm_buffer_size);
     fprintf(stderr, "period_size = %d\n", (int) pcm_period_size);
